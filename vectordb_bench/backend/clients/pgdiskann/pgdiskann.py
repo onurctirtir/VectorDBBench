@@ -327,6 +327,14 @@ class PgDiskANN(VectorDB):
             if citus_available:
                 log.info(f"{self.name} Citus extension found, creating distributed table")
                 
+                # Set shard count from config BEFORE creating distributed table (optimized for 500K rows)
+                shard_count = getattr(self.case_config, 'shard_count', 8)
+                log.info(f"{self.name} Setting shard count to {shard_count}")
+                
+                # Apply shard count setting
+                self.cursor.execute(f"SET citus.shard_count = {shard_count}")
+                self.conn.commit()
+                
                 # Create distributed table with hash distribution on id column
                 self.cursor.execute(
                     sql.SQL("SELECT create_distributed_table({table_name}, 'id');").format(
@@ -335,47 +343,14 @@ class PgDiskANN(VectorDB):
                 )
                 self.conn.commit()
                 
-                # Set shard count from config (optimized for 500K rows)
-                shard_count = getattr(self.case_config, 'shard_count', 8)
-                log.info(f"{self.name} Setting shard count to {shard_count}")
-                
-                # Get distribution info
+                # Verify shard creation with single query
                 self.cursor.execute(
-                    sql.SQL("SELECT * FROM pg_dist_partition WHERE logicalrelid = {table_name}::regclass;").format(
+                    sql.SQL("SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = {table_name}::regclass;").format(
                         table_name=sql.Literal(self.table_name)
                     )
                 )
-                dist_info = self.cursor.fetchall()
-                log.info(f"{self.name} Successfully created distributed table with {len(dist_info)} partition(s)")
-                log.info(f"{self.name} Distribution info: {dist_info}")
-                
-                # Get shard distribution across workers
-                try:
-                    # Get basic shard information
-                    self.cursor.execute(
-                        sql.SQL("SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = {table_name}::regclass;").format(
-                            table_name=sql.Literal(self.table_name)
-                        )
-                    )
-                    actual_shard_count = self.cursor.fetchone()[0]
-                    log.info(f"{self.name} Actual shard count created: {actual_shard_count}")
-                    
-                    # Get shard placement information
-                    self.cursor.execute(
-                        sql.SQL("SELECT sp.shardid, sp.shardstate, sp.nodename, sp.nodeport FROM pg_dist_shard_placement sp JOIN pg_dist_shard s ON sp.shardid = s.shardid WHERE s.logicalrelid = {table_name}::regclass ORDER BY sp.shardid;").format(
-                            table_name=sql.Literal(self.table_name)
-                        )
-                    )
-                    shard_info = self.cursor.fetchall()
-                    log.info(f"{self.name} Shard distribution: {shard_info}")
-                    
-                    # Get worker node information
-                    self.cursor.execute("SELECT nodename, nodeport FROM pg_dist_node WHERE isactive = true;")
-                    worker_info = self.cursor.fetchall()
-                    log.info(f"{self.name} Active worker nodes: {worker_info}")
-                    
-                except Exception as e:
-                    log.info(f"{self.name} Could not get shard distribution info: {e}")
+                actual_shard_count = self.cursor.fetchone()[0]
+                log.info(f"{self.name} Successfully created distributed table with {actual_shard_count} shards")
                 
             else:
                 log.warning(f"{self.name} Citus extension not found, creating regular table")
@@ -464,17 +439,13 @@ class PgDiskANN(VectorDB):
                     # 1. Current GUC parameters (live state) - ACTIVE
                     config_metrics['current_guc_parameters'] = self._collect_live_guc_parameters(cursor)
                     
-                    # 2. Current Citus state (if enabled) - ACTIVE
-                    #if self.case_config.enable_citus_distribution:
-                    #    config_metrics['citus_runtime_state'] = self._collect_citus_runtime_state(cursor)
+                    # 2. DiskANN parameters (always collected) - ACTIVE
+                    config_metrics['diskann_parameters'] = self._collect_diskann_parameters(cursor)
                     
-                    # COMMENTED OUT - Not needed for current use case
-                    # config_metrics['table_statistics'] = self._collect_current_table_stats(cursor)
-                    # config_metrics['session_state'] = self._collect_session_state(cursor)
-                    # config_metrics['index_statistics'] = self._collect_index_statistics(cursor)
-                    # config_metrics['memory_usage'] = self._collect_memory_usage(cursor)
-                    # config_metrics['query_performance_settings'] = self._collect_query_performance_settings(cursor)
-                    
+                    # 3. Current Citus state (if enabled) - ACTIVE
+                    if self.case_config.enable_citus_distribution:
+                        config_metrics['citus_runtime_state'] = self._collect_citus_runtime_state(cursor)
+                 
                     log.info("🔍 POST_BENCHMARK_ANALYSIS_END")
                     
                     return config_metrics
@@ -489,73 +460,18 @@ class PgDiskANN(VectorDB):
         try:
             guc_params = {}
             
-            # Define all the Citus parameters to collect
+            # Define only the essential Citus parameters to collect
             citus_parameters = [
-                'citus.all_modifications_commutative',
-                'citus.background_task_queue_interval',
-                'citus.cluster_name',
-                'citus.coordinator_aggregation_strategy',
-                'citus.count_distinct_error_rate',
-                'citus.cpu_priority',
-                'citus.cpu_priority_for_logical_replication_senders',
-                'citus.defer_drop_after_shard_move',
-                'citus.defer_drop_after_shard_split',
-                'citus.defer_shard_delete_interval',
-                'citus.desired_percent_disk_available_after_move',
-                'citus.distributed_deadlock_detection_factor',
-                'citus.enable_binary_protocol',
-                'citus.enable_change_data_capture',
-                'citus.enable_create_role_propagation',
-                'citus.enable_deadlock_prevention',
-                'citus.enable_local_execution',
-                'citus.enable_local_reference_table_foreign_keys',
-                'citus.enable_repartition_joins',
-                'citus.enable_schema_based_sharding',
-                'citus.enable_statistics_collection',
-                'citus.explain_all_tasks',
-                'citus.explain_analyze_sort_method',
-                'citus.limit_clause_row_fetch_count',
-                'citus.local_hostname',
-                'citus.local_shared_pool_size',
-                'citus.local_table_join_policy',
-                'citus.log_remote_commands',
                 'citus.max_adaptive_executor_pool_size',
-                'citus.max_background_task_executors',
-                'citus.max_background_task_executors_per_node',
                 'citus.max_cached_connection_lifetime',
                 'citus.max_cached_conns_per_worker',
                 'citus.max_client_connections',
-                'citus.max_high_priority_background_processes',
-                'citus.max_intermediate_result_size',
-                'citus.max_matview_size_to_auto_recreate',
                 'citus.max_shared_pool_size',
-                'citus.max_worker_nodes_tracked',
-                'citus.multi_shard_modify_mode',
-                'citus.multi_task_query_log_level',
-                'citus.node_connection_timeout',
-                'citus.node_conninfo',
-                'citus.propagate_set_commands',
-                'citus.recover_2pc_interval',
-                'citus.remote_task_check_interval',
-                'citus.shard_count',
-                'citus.shard_replication_factor',
-                'citus.show_shards_for_app_name_prefixes',
-                'citus.skip_constraint_validation',
-                'citus.skip_jsonb_validation_in_copy',
-                'citus.stat_statements_track',
-                'citus.stat_tenants_limit',
-                'citus.stat_tenants_log_level',
-                'citus.stat_tenants_period',
-                'citus.stat_tenants_track',
-                'citus.stat_tenants_untracked_sample_rate',
-                'citus.task_assignment_policy',
-                'citus.task_executor_type',
-                'citus.use_citus_managed_tables',
-                'citus.use_secondary_nodes',
-                'citus.values_materialization_threshold',
-                'citus.version',
-                'citus.worker_min_messages',
-                'citus.writable_standby_coordinator'
+                'citus.local_shared_pool_size',
+                'citus.executor_slow_start_interval',
+                'citus.force_max_query_parallelization',
+                'citus.enable_binary_protocol',
+                'citus.enable_repartition_joins'
             ]
             
             # Use simple SHOW commands for each parameter
@@ -589,220 +505,113 @@ class PgDiskANN(VectorDB):
             log.error(f"Error collecting Citus GUC parameters: {e}")
             return {'error': str(e)}
     
+    def _collect_diskann_parameters(self, cursor) -> dict:
+        """Collect DiskANN parameters from index definition and configuration."""
+        try:
+            diskann_params = {}
+            
+            # 1. Get configured values from benchmark config (these are the actual values used)
+            diskann_params['configured_l_value_is'] = getattr(self.case_config, 'l_value_is', 'NOT_SET')
+            diskann_params['configured_l_value_ib'] = getattr(self.case_config, 'l_value_ib', 'NOT_SET') 
+            diskann_params['configured_max_neighbors'] = getattr(self.case_config, 'max_neighbors', 'NOT_SET')
+            diskann_params['configured_metric_type'] = getattr(self.case_config, 'metric_type', 'NOT_SET')
+            diskann_params['configured_maintenance_work_mem'] = getattr(self.case_config, 'maintenance_work_mem', 'NOT_SET')
+            diskann_params['configured_max_parallel_workers'] = getattr(self.case_config, 'max_parallel_workers', 'NOT_SET')
+            
+            # 2. Get actual index definition from database
+            try:
+                cursor.execute("""
+                    SELECT 
+                        indexname,
+                        indexdef
+                    FROM pg_indexes 
+                    WHERE tablename = %s 
+                    AND indexdef ILIKE '%%diskann%%'
+                """, (self.table_name,))
+                
+                index_result = cursor.fetchone()
+                if index_result:
+                    diskann_params['index_name'] = index_result[0]
+                    diskann_params['index_definition'] = index_result[1]
+                    
+                    # Parse WITH clause to extract actual DiskANN parameters
+                    index_def = index_result[1]
+                    if 'WITH (' in index_def:
+                        with_clause = index_def.split('WITH (')[1].split(')')[0]
+                        diskann_params['index_with_options'] = with_clause
+                        
+                        # Parse individual options
+                        options = [opt.strip() for opt in with_clause.split(',')]
+                        for option in options:
+                            if '=' in option:
+                                key, value = option.split('=', 1)
+                                diskann_params[f'actual_{key.strip()}'] = value.strip()
+                    else:
+                        diskann_params['index_with_options'] = 'No WITH clause found'
+                else:
+                    diskann_params['index_definition'] = 'No DiskANN index found'
+                    
+            except Exception as e:
+                diskann_params['index_query_error'] = str(e)
+            
+            # 3. Get extension information
+            try:
+                cursor.execute("""
+                    SELECT extname, extversion 
+                    FROM pg_extension 
+                    WHERE extname LIKE '%diskann%'
+                """)
+                ext_result = cursor.fetchone()
+                if ext_result:
+                    diskann_params['extension_name'] = ext_result[0]
+                    diskann_params['extension_version'] = ext_result[1]
+                else:
+                    diskann_params['extension_info'] = 'No DiskANN extension found'
+                    
+            except Exception as e:
+                diskann_params['extension_query_error'] = str(e)
+            
+            # Add collection metadata
+            diskann_params['_collection_info'] = {
+                'timestamp': datetime.now().isoformat(),
+                'method': 'config_and_index_definition',
+                'note': 'DiskANN parameters are index-level options, not GUC parameters'
+            }
+            
+            log.info("Collected DiskANN parameters from config and index definition")
+            return diskann_params
+            
+        except Exception as e:
+            log.error(f"Error collecting DiskANN parameters: {e}")
+            return {'error': str(e)}
+    
     def _collect_citus_runtime_state(self, cursor) -> dict:
         """Collect current Citus runtime state."""
         try:
-            citus_state = {}
-            
-            # 1. Get basic shard information
-            cursor.execute(f"""
-                SELECT 
-                    COUNT(*) as total_shards,
-                    MIN(shardid) as min_shard_id,
-                    MAX(shardid) as max_shard_id
-                FROM pg_dist_shard 
-                WHERE logicalrelid = '{self.table_name}'::regclass
-            """)
-            shard_summary = cursor.fetchone()
-            if shard_summary:
-                citus_state['shard_summary'] = {
-                    'total_shards': shard_summary[0],
-                    'min_shard_id': shard_summary[1],
-                    'max_shard_id': shard_summary[2]
-                }
-            
-            # 2. Get detailed shard distribution across workers
-            cursor.execute(f"""
-                SELECT 
-                    s.shardid,
-                    s.shardminvalue,
-                    s.shardmaxvalue,
-                    n.nodename,
-                    n.nodeport,
-                    p.shardstate,
-                    CASE 
-                        WHEN p.shardstate = 1 THEN 'ACTIVE'
-                        WHEN p.shardstate = 3 THEN 'INACTIVE'
-                        ELSE 'UNKNOWN'
-                    END as state_description
-                FROM pg_dist_shard s
-                JOIN pg_dist_placement p ON s.shardid = p.shardid
-                JOIN pg_dist_node n ON p.groupid = n.groupid
-                WHERE s.logicalrelid = '{self.table_name}'::regclass
-                ORDER BY s.shardid
-            """)
-            shard_details = cursor.fetchall()
-            
-            citus_state['shard_distribution'] = []
-            for shard in shard_details:
-                citus_state['shard_distribution'].append({
-                    'shard_id': shard[0],
-                    'min_hash_value': shard[1],
-                    'max_hash_value': shard[2],
-                    'worker_node': shard[3],
-                    'worker_port': shard[4],
-                    'shard_state': shard[5],
-                    'state_description': shard[6]
-                })
-            
-            # 3. Get worker node information
+            # Get shard distribution across workers - single query only
             cursor.execute("""
-                SELECT 
-                    nodename,
-                    nodeport,
-                    isactive,
-                    noderole,
-                    shouldhaveshards
-                FROM pg_dist_node
-                WHERE noderole = 'primary'
-                ORDER BY nodename
+                SELECT nodename, nodeport, count(*) as shard_count_on_node
+                FROM pg_dist_shard
+                JOIN pg_dist_placement USING (shardid)
+                JOIN pg_class ON (logicalrelid = oid)
+                JOIN pg_dist_node USING (groupid)
+                WHERE relname = 'pg_diskann_collection'
+                GROUP BY (nodename, nodeport)
+                ORDER BY nodeport
             """)
-            worker_nodes = cursor.fetchall()
+            results = cursor.fetchall()
             
-            citus_state['worker_nodes'] = []
-            for worker in worker_nodes:
-                citus_state['worker_nodes'].append({
-                    'node_name': worker[0],
-                    'node_port': worker[1],
-                    'is_active': worker[2],
-                    'node_role': worker[3],
-                    'should_have_shards': worker[4]
-                })
-            
-            # 4. Calculate shards per worker
-            cursor.execute(f"""
-                SELECT 
-                    n.nodename,
-                    n.nodeport,
-                    COUNT(*) as shard_count
-                FROM pg_dist_shard s
-                JOIN pg_dist_placement p ON s.shardid = p.shardid
-                JOIN pg_dist_node n ON p.groupid = n.groupid
-                WHERE s.logicalrelid = '{self.table_name}'::regclass
-                AND p.shardstate = 1
-                GROUP BY n.nodename, n.nodeport
-                ORDER BY n.nodename
-            """)
-            shards_per_worker_results = cursor.fetchall()
-            
-            citus_state['shards_per_worker'] = []
-            for worker_shard in shards_per_worker_results:
-                citus_state['shards_per_worker'].append({
-                    'worker_node': worker_shard[0],
-                    'worker_port': worker_shard[1],
-                    'shard_count': worker_shard[2]
-                })
-            
-            # 5. Get row count per shard (entries per shard)
-            # This requires querying each shard individually
-            entries_per_shard = []
-            total_entries = 0
-            
-            try:
-                for shard_info in citus_state['shard_distribution']:
-                    shard_id = shard_info['shard_id']
-                    try:
-                        # Query the specific shard table
-                        cursor.execute(f"""
-                            SELECT COUNT(*) 
-                            FROM {self.table_name}_{shard_id}
-                        """)
-                        row_count = cursor.fetchone()[0]
-                        entries_per_shard.append({
-                            'shard_id': shard_id,
-                            'worker_node': shard_info['worker_node'],
-                            'entry_count': row_count
-                        })
-                        total_entries += row_count
-                    except Exception as e:
-                        # If direct shard query fails, try alternative method
-                        entries_per_shard.append({
-                            'shard_id': shard_id,
-                            'worker_node': shard_info['worker_node'],
-                            'entry_count': f'ERROR: {str(e)}'
-                        })
-                
-                citus_state['entries_per_shard'] = entries_per_shard
-                citus_state['total_entries_across_shards'] = total_entries
-                
-            except Exception as e:
-                log.warning(f"Could not get per-shard row counts: {e}")
-                
-                # Alternative: Get total table row count
-                try:
-                    cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")
-                    total_rows = cursor.fetchone()[0]
-                    citus_state['total_table_rows'] = total_rows
-                    
-                    # Estimate entries per shard
-                    if citus_state['shard_summary']['total_shards'] > 0:
-                        avg_entries_per_shard = total_rows / citus_state['shard_summary']['total_shards']
-                        citus_state['estimated_avg_entries_per_shard'] = round(avg_entries_per_shard, 2)
-                    
-                except Exception as e2:
-                    citus_state['row_count_error'] = str(e2)
-            
-            # 6. Get distribution quality metrics
-            if citus_state.get('shards_per_worker'):
-                shard_counts = [worker['shard_count'] for worker in citus_state['shards_per_worker']]
-                if shard_counts:
-                    min_shards = min(shard_counts)
-                    max_shards = max(shard_counts)
-                    avg_shards = sum(shard_counts) / len(shard_counts)
-                    
-                    citus_state['distribution_quality'] = {
-                        'min_shards_per_worker': min_shards,
-                        'max_shards_per_worker': max_shards,
-                        'avg_shards_per_worker': round(avg_shards, 2),
-                        'distribution_variance': round(max_shards - min_shards, 2),
-                        'is_balanced': max_shards - min_shards <= 1  # Within 1 shard difference
-                    }
-            
-            # 7. Add collection metadata
-            citus_state['_collection_info'] = {
-                'timestamp': datetime.now().isoformat(),
-                'table_name': self.table_name,
-                'total_workers': len(citus_state.get('worker_nodes', [])),
-                'active_workers': len([w for w in citus_state.get('worker_nodes', []) if w['is_active']]),
-                'method': 'citus_metadata_queries'
+            return {
+                'shards_per_worker': [
+                    {
+                        'worker_node': row[0],
+                        'worker_port': row[1], 
+                        'shard_count': row[2]
+                    } for row in results
+                ]
             }
-            
-            log.info(f"Collected Citus runtime state: {citus_state['shard_summary']['total_shards']} shards across {citus_state['_collection_info']['active_workers']} workers")
-            return citus_state
             
         except Exception as e:
             log.error(f"Error collecting Citus runtime state: {e}")
             return {'error': str(e)}
     
-    # COMMENTED OUT SKELETON METHODS - Not needed for current use case
-    # Uncomment and implement when needed in the future
-    
-    # def _collect_current_table_stats(self, cursor) -> dict:
-    #     """Collect current table statistics while data is loaded."""
-    #     # TODO: Implement table size, row count, etc. queries here
-    #     # Example: cursor.execute(f"SELECT pg_size_pretty(pg_total_relation_size('{self.table_name}'))")
-    #     return {'placeholder': 'implement_table_stats_queries_here'}
-    
-    # def _collect_session_state(self, cursor) -> dict:
-    #     """Collect current session and connection state."""
-    #     # TODO: Implement session info queries here
-    #     # Example: cursor.execute("SELECT current_database(), current_user, version()")
-    #     return {'placeholder': 'implement_session_queries_here'}
-    
-    # def _collect_index_statistics(self, cursor) -> dict:
-    #     """Collect current index usage statistics."""
-    #     # TODO: Implement index stats queries here
-    #     # Example: cursor.execute("SELECT * FROM pg_stat_user_indexes WHERE tablename = %s", (self.table_name,))
-    #     return {'placeholder': 'implement_index_stats_queries_here'}
-    
-    # def _collect_memory_usage(self, cursor) -> dict:
-    #     """Collect current memory usage information."""
-    #     # TODO: Implement memory usage queries here
-    #     # Example: cursor.execute("SELECT name, setting FROM pg_settings WHERE name LIKE '%mem%'")
-    #     return {'placeholder': 'implement_memory_queries_here'}
-    
-    # def _collect_query_performance_settings(self, cursor) -> dict:
-    #     """Collect current query performance related settings."""
-    #     # TODO: Implement query performance settings queries here
-    #     # Example: cursor.execute("SELECT name, setting FROM pg_settings WHERE name LIKE 'enable_%'")
-    #     return {'placeholder': 'implement_performance_queries_here'}
