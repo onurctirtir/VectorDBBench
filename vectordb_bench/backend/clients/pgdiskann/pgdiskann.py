@@ -506,83 +506,72 @@ class PgDiskANN(VectorDB):
             return {'error': str(e)}
     
     def _collect_diskann_parameters(self, cursor) -> dict:
-        """Collect DiskANN parameters from index definition and configuration."""
+        """Collect DiskANN GUC parameters using SHOW commands."""
         try:
             diskann_params = {}
             
-            # 1. Get configured values from benchmark config (these are the actual values used)
-            diskann_params['configured_l_value_is'] = getattr(self.case_config, 'l_value_is', 'NOT_SET')
-            diskann_params['configured_l_value_ib'] = getattr(self.case_config, 'l_value_ib', 'NOT_SET') 
-            diskann_params['configured_max_neighbors'] = getattr(self.case_config, 'max_neighbors', 'NOT_SET')
-            diskann_params['configured_metric_type'] = getattr(self.case_config, 'metric_type', 'NOT_SET')
-            diskann_params['configured_maintenance_work_mem'] = getattr(self.case_config, 'maintenance_work_mem', 'NOT_SET')
-            diskann_params['configured_max_parallel_workers'] = getattr(self.case_config, 'max_parallel_workers', 'NOT_SET')
-            
-            # 2. Get actual index definition from database
+            # First, set session parameters exactly like in init() method
             try:
-                cursor.execute("""
-                    SELECT 
-                        indexname,
-                        indexdef
-                    FROM pg_indexes 
-                    WHERE tablename = %s 
-                    AND indexdef ILIKE '%%diskann%%'
-                """, (self.table_name,))
+                session_options: dict[str, Any] = self.case_config.session_param()
                 
-                index_result = cursor.fetchone()
-                if index_result:
-                    diskann_params['index_name'] = index_result[0]
-                    diskann_params['index_definition'] = index_result[1]
-                    
-                    # Parse WITH clause to extract actual DiskANN parameters
-                    index_def = index_result[1]
-                    if 'WITH (' in index_def:
-                        with_clause = index_def.split('WITH (')[1].split(')')[0]
-                        diskann_params['index_with_options'] = with_clause
-                        
-                        # Parse individual options
-                        options = [opt.strip() for opt in with_clause.split(',')]
-                        for option in options:
-                            if '=' in option:
-                                key, value = option.split('=', 1)
-                                diskann_params[f'actual_{key.strip()}'] = value.strip()
-                    else:
-                        diskann_params['index_with_options'] = 'No WITH clause found'
-                else:
-                    diskann_params['index_definition'] = 'No DiskANN index found'
-                    
+                if len(session_options) > 0:
+                    for setting_name, setting_val in session_options.items():
+                        if 'diskann' in setting_name.lower():  # Only set DiskANN params
+                            command = sql.SQL("SET {setting_name} = {setting_val};").format(
+                                setting_name=sql.Identifier(setting_name),
+                                setting_val=sql.Literal(str(setting_val)),
+                            )
+                            cursor.execute(command)
+                            log.info(f"Set DiskANN parameter: {setting_name} = {setting_val}")
+                
+                # Also set iterative_search to a default value since it's not in session_param()
+                try:
+                    cursor.execute("SET diskann.iterative_search = 'Relaxed_Order'")
+                    log.info("Set DiskANN parameter: diskann.iterative_search = Relaxed_Order (default)")
+                except Exception as e:
+                    log.warning(f"Failed to set diskann.iterative_search: {e}")
+                
+                cursor.connection.commit()
+                log.info("Successfully applied DiskANN session parameters")
+                
             except Exception as e:
-                diskann_params['index_query_error'] = str(e)
+                log.warning(f"Failed to set DiskANN session parameters: {e}")
             
-            # 3. Get extension information
-            try:
-                cursor.execute("""
-                    SELECT extname, extversion 
-                    FROM pg_extension 
-                    WHERE extname LIKE '%diskann%'
-                """)
-                ext_result = cursor.fetchone()
-                if ext_result:
-                    diskann_params['extension_name'] = ext_result[0]
-                    diskann_params['extension_version'] = ext_result[1]
-                else:
-                    diskann_params['extension_info'] = 'No DiskANN extension found'
-                    
-            except Exception as e:
-                diskann_params['extension_query_error'] = str(e)
+            # Define the 2 essential DiskANN parameters to collect
+            diskann_guc_parameters = [
+                'diskann.l_value_is',
+                'diskann.iterative_search'
+            ]
+            
+            # Use simple SHOW commands for each parameter
+            successful_params = 0
+            failed_params = 0
+            
+            for param in diskann_guc_parameters:
+                try:
+                    cursor.execute(f"SHOW {param}")
+                    result = cursor.fetchone()
+                    diskann_params[param] = result[0] if result else 'NOT_AVAILABLE'
+                    successful_params += 1
+                except Exception as e:
+                    diskann_params[param] = f'ERROR: {str(e)}'
+                    failed_params += 1
             
             # Add collection metadata
             diskann_params['_collection_info'] = {
                 'timestamp': datetime.now().isoformat(),
-                'method': 'config_and_index_definition',
-                'note': 'DiskANN parameters are index-level options, not GUC parameters'
+                'total_parameters_requested': len(diskann_guc_parameters),
+                'successful_parameters': successful_params,
+                'failed_parameters': failed_params,
+                'method': 'SHOW_commands_with_session_setup',
+                'success_rate': f"{(successful_params/len(diskann_guc_parameters)*100):.1f}%"
             }
             
-            log.info("Collected DiskANN parameters from config and index definition")
+            log.info(f"Collected {successful_params}/{len(diskann_guc_parameters)} DiskANN GUC parameters using SHOW commands")
             return diskann_params
             
         except Exception as e:
-            log.error(f"Error collecting DiskANN parameters: {e}")
+            log.error(f"Error collecting DiskANN GUC parameters: {e}")
             return {'error': str(e)}
     
     def _collect_citus_runtime_state(self, cursor) -> dict:
