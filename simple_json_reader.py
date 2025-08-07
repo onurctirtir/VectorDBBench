@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-def print_readable(data, indent=0, file=None, max_list_items=5):
+def print_readable(data, indent=0, file=None, max_list_items=None):
     """Print JSON data in a clean, readable format."""
     def write(text):
         if file:
@@ -50,20 +50,14 @@ def print_readable(data, indent=0, file=None, max_list_items=5):
             write(f"{prefix}(empty)")
             return
             
-        # Show first few items, then summarize if too many
-        items_to_show = min(len(data), max_list_items)
-        
-        for i in range(items_to_show):
+        # Show all items (no trimming)
+        for i in range(len(data)):
             item = data[i]
             if isinstance(item, (dict, list)):
                 write(f"{prefix}[{i}]:")
                 print_readable(item, indent + 1, file, max_list_items)
             else:
                 write(f"{prefix}[{i}]: {item}")
-        
-        # Show summary if there are more items
-        if len(data) > max_list_items:
-            write(f"{prefix}... and {len(data) - max_list_items} more items")
     
     else:
         write(f"{prefix}{data}")

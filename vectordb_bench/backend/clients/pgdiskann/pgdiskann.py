@@ -1,6 +1,8 @@
 """Wrapper around the pg_diskann vector database over VectorDB"""
 
 import logging
+import multiprocessing as mp
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
@@ -445,6 +447,12 @@ class PgDiskANN(VectorDB):
                     # 3. Current Citus state (if enabled) - ACTIVE
                     if self.case_config.enable_citus_distribution:
                         config_metrics['citus_runtime_state'] = self._collect_citus_runtime_state(cursor)
+                        # Commit to ensure the next operation starts in a fresh transaction
+                        conn.commit()
+                        log.info("Committed transaction after collecting Citus state to allow for clean EXPLAIN.")
+                    
+                    # 4. Query Plan for QPS benchmark query - NEW (isolated connection)
+                    config_metrics['query_plans'] = self._collect_query_plans()
                  
                     log.info("🔍 POST_BENCHMARK_ANALYSIS_END")
                     
@@ -604,3 +612,76 @@ class PgDiskANN(VectorDB):
             log.error(f"Error collecting Citus runtime state: {e}")
             return {'error': str(e)}
     
+    def _collect_query_plans(self) -> dict:
+        """
+        Collect EXPLAIN ANALYZE plans for the QPS benchmark query.
+        This runs in a completely isolated connection to avoid transaction conflicts.
+        """
+        log.info("🔍 Collecting query execution plan in isolated connection...")
+        try:
+            # Create a completely new, isolated connection for this specific task
+            with psycopg.connect(**self.db_config) as conn:
+                register_vector(conn)
+                with conn.cursor() as cursor:
+                    query_plans = {}
+
+                    # 1. Must be the FIRST command - disable local execution
+                    cursor.execute("SET LOCAL citus.enable_local_execution TO OFF;")
+                    log.info("Set citus.enable_local_execution to OFF for EXPLAIN.")
+
+                    # 2. Set up the same session parameters as during the benchmark
+                    try:
+                        session_options: dict[str, Any] = self.case_config.session_param()
+                        if len(session_options) > 0:
+                            for setting_name, setting_val in session_options.items():
+                                command = sql.SQL("SET {setting_name} = {setting_val};").format(
+                                    setting_name=sql.Identifier(setting_name),
+                                    setting_val=sql.Literal(str(setting_val)),
+                                )
+                                cursor.execute(command)
+                        
+                        cursor.execute("SET diskann.iterative_search = 'Relaxed_Order'")
+                        log.info("Session parameters set for EXPLAIN.")
+                    except Exception as e:
+                        log.warning(f"Could not set session parameters for EXPLAIN: {e}")
+
+                    # 3. Reconstruct the exact QPS benchmark query
+                    unfiltered_search_query = sql.Composed([
+                        sql.SQL("SELECT id FROM public.{} ORDER BY embedding ").format(
+                            sql.Identifier(self.table_name),
+                        ),
+                        sql.SQL(self.case_config.search_param()["metric_fun_op"]),
+                        sql.SQL(" %s::vector LIMIT %s::int"),
+                    ])
+
+                    # 4. Get a sample vector from the table
+                    try:
+                        cursor.execute(f"SELECT embedding FROM public.{self.table_name} LIMIT 1")
+                        sample_vector = cursor.fetchone()[0]
+                    except Exception as e:
+                        log.error(f"Could not fetch sample vector: {e}")
+                        return {'error': 'Could not fetch sample vector for EXPLAIN.', 'details': str(e)}
+
+                    # 5. Run EXPLAIN with FORMAT JSON
+                    try:
+                        explain_query = sql.SQL("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ") + unfiltered_search_query
+                        cursor.execute(explain_query, (sample_vector, 100))
+                        plan_result = cursor.fetchone()[0]
+                        
+                        query_plans['qps_benchmark_plan'] = {
+                            'query_sql': unfiltered_search_query.as_string(conn),
+                            'plan': plan_result,
+                        }
+                        log.info("✅ Successfully collected QPS benchmark query plan.")
+                    except Exception as e:
+                        log.error(f"Failed to run EXPLAIN: {e}")
+                        query_plans['qps_benchmark_plan'] = {
+                            'error': 'Failed to execute EXPLAIN.', 
+                            'details': str(e)
+                        }
+                    
+                    return query_plans
+
+        except Exception as e:
+            log.error(f"Critical error in _collect_query_plans: {e}")
+            return {'error': str(e)}
