@@ -12,3 +12,13 @@ venv/
 .idea/
 results/
 logs/
+pgdiskann_config.yml
+
+# Analysis scripts and results
+specialized_analysis.py
+analyses/
+
+# Additional log files
+*.log
+vectordb_bench.log
+benchmark_*.log

@@ -1,8 +1,11 @@
 """Wrapper around the pg_diskann vector database over VectorDB"""
 
 import logging
+import multiprocessing as mp
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -75,8 +78,37 @@ class PgDiskANN(VectorDB):
     @staticmethod
     def _create_connection(**kwargs) -> tuple[Connection, Cursor]:
         conn = psycopg.connect(**kwargs)
-        conn.cursor().execute("CREATE EXTENSION IF NOT EXISTS pg_diskann CASCADE")
-        conn.commit()
+        cursor = conn.cursor()
+        
+        # Enable extensions - Azure Database for PostgreSQL has pre-installed extensions
+        # We need to enable them, not create them
+        try:
+            # Check which extensions are already enabled
+            cursor.execute("SELECT extname FROM pg_extension WHERE extname IN ('pg_diskann', 'vector', 'citus');")
+            enabled_extensions = [row[0] for row in cursor.fetchall()]
+            
+            # Enable pg_diskann extension if not already enabled
+            if 'pg_diskann' not in enabled_extensions:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_diskann CASCADE")
+                log.info("PgDiskANN extension enabled successfully")
+            
+            # Enable vector extension if not already enabled
+            if 'vector' not in enabled_extensions:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector CASCADE")
+                log.info("Vector extension enabled successfully")
+                
+            # Enable citus extension if not already enabled (for Azure Citus)
+            if 'citus' not in enabled_extensions:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS citus CASCADE")
+                log.info("Citus extension enabled successfully")
+                
+            conn.commit()
+            
+        except Exception as e:
+            log.warning(f"Extension setup warning: {e}")
+            # Try to continue anyway, extensions might already be available
+            conn.rollback()
+        
         register_vector(conn)
         conn.autocommit = False
         cursor = conn.cursor()
@@ -263,15 +295,71 @@ class PgDiskANN(VectorDB):
         try:
             log.info(f"{self.name} client create table : {self.table_name}")
 
+            # Create the table first
             self.cursor.execute(
                 sql.SQL(
                     "CREATE TABLE IF NOT EXISTS public.{table_name} (id BIGINT PRIMARY KEY, embedding vector({dim}));",
                 ).format(table_name=sql.Identifier(self.table_name), dim=dim),
             )
             self.conn.commit()
+
+            # Check if Citus extension is available and create distributed table
+            self._create_distributed_table()
+            
         except Exception as e:
             log.warning(f"Failed to create pgdiskann table: {self.table_name} error: {e}")
             raise e from None
+
+    def _create_distributed_table(self):
+        assert self.conn is not None, "Connection is not initialized"
+        assert self.cursor is not None, "Cursor is not initialized"
+
+        # Check if Citus distribution is enabled in config
+        if not getattr(self.case_config, 'enable_citus_distribution', True):
+            log.info(f"{self.name} Citus distribution disabled in config")
+            return
+
+        try:
+            # Check if Citus extension is enabled (Azure Citus should have it pre-installed)
+            self.cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'citus');"
+            )
+            citus_available = self.cursor.fetchone()[0]
+            
+            if citus_available:
+                log.info(f"{self.name} Citus extension found, creating distributed table")
+                
+                # Set shard count from config BEFORE creating distributed table (optimized for 500K rows)
+                shard_count = getattr(self.case_config, 'shard_count', 8)
+                log.info(f"{self.name} Setting shard count to {shard_count}")
+                
+                # Apply shard count setting
+                self.cursor.execute(f"SET citus.shard_count = {shard_count}")
+                self.conn.commit()
+                
+                # Create distributed table with hash distribution on id column
+                self.cursor.execute(
+                    sql.SQL("SELECT create_distributed_table({table_name}, 'id');").format(
+                        table_name=sql.Literal(self.table_name)
+                    )
+                )
+                self.conn.commit()
+                
+                # Verify shard creation with single query
+                self.cursor.execute(
+                    sql.SQL("SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = {table_name}::regclass;").format(
+                        table_name=sql.Literal(self.table_name)
+                    )
+                )
+                actual_shard_count = self.cursor.fetchone()[0]
+                log.info(f"{self.name} Successfully created distributed table with {actual_shard_count} shards")
+                
+            else:
+                log.warning(f"{self.name} Citus extension not found, creating regular table")
+                
+        except Exception as e:
+            log.warning(f"Failed to create distributed table: {e}")
+            log.info(f"{self.name} Falling back to regular table creation")
 
     def insert_embeddings(
         self,
@@ -327,3 +415,273 @@ class PgDiskANN(VectorDB):
             result = self.cursor.execute(self._unfiltered_search, (q, k), prepare=True, binary=True)
 
         return [int(i[0]) for i in result.fetchall()]
+
+    def collect_post_benchmark_config(self) -> dict:
+        """
+        Collect comprehensive database configuration metrics after benchmark completion.
+        This runs while data is still loaded to capture actual runtime state.
+                
+        Returns:
+            dict: Comprehensive configuration metrics collected from the live database
+        """
+        try:
+            # Re-establish connection for post-benchmark analysis if needed
+            with psycopg.connect(**self.db_config) as conn:
+                with conn.cursor() as cursor:
+                    
+                    log.info("🔍 POST_BENCHMARK_ANALYSIS_START")
+                    
+                    config_metrics = {
+                        'collection_timestamp': datetime.now().isoformat(),
+                        'data_still_loaded': True,
+                        'analysis_phase': 'post_benchmark'
+                    }
+                    
+                    
+                    # 1. Current GUC parameters (live state) - ACTIVE
+                    config_metrics['current_guc_parameters'] = self._collect_live_guc_parameters(cursor)
+                    
+                    # 2. DiskANN parameters (always collected) - ACTIVE
+                    config_metrics['diskann_parameters'] = self._collect_diskann_parameters(cursor)
+                    
+                    # 3. Current Citus state (if enabled) - ACTIVE
+                    if self.case_config.enable_citus_distribution:
+                        config_metrics['citus_runtime_state'] = self._collect_citus_runtime_state(cursor)
+                        # Commit to ensure the next operation starts in a fresh transaction
+                        conn.commit()
+                        log.info("Committed transaction after collecting Citus state to allow for clean EXPLAIN.")
+                    
+                    # 4. Query Plan for QPS benchmark query - NEW (isolated connection)
+                    config_metrics['query_plans'] = self._collect_query_plans()
+                 
+                    log.info("🔍 POST_BENCHMARK_ANALYSIS_END")
+                    
+                    return config_metrics
+                    
+        except Exception as e:
+            log.error(f"Error collecting post-benchmark config: {e}")
+            return {'error': str(e)}
+    
+    
+    def _collect_live_guc_parameters(self, cursor) -> dict:
+        """Collect current GUC parameter values in live system."""
+        try:
+            guc_params = {}
+            
+            # Define only the essential Citus parameters to collect
+            citus_parameters = [
+                'citus.max_adaptive_executor_pool_size',
+                'citus.max_cached_connection_lifetime',
+                'citus.max_cached_conns_per_worker',
+                'citus.max_client_connections',
+                'citus.max_shared_pool_size',
+                'citus.local_shared_pool_size',
+                'citus.executor_slow_start_interval',
+                'citus.force_max_query_parallelization',
+                'citus.enable_binary_protocol',
+                'citus.enable_repartition_joins'
+            ]
+            
+            # Use simple SHOW commands for each parameter
+            successful_params = 0
+            failed_params = 0
+            
+            for param in citus_parameters:
+                try:
+                    cursor.execute(f"SHOW {param}")
+                    result = cursor.fetchone()
+                    guc_params[param] = result[0] if result else 'NOT_AVAILABLE'
+                    successful_params += 1
+                except Exception as e:
+                    guc_params[param] = f'ERROR: {str(e)}'
+                    failed_params += 1
+            
+            # Add collection metadata
+            guc_params['_collection_info'] = {
+                'timestamp': datetime.now().isoformat(),
+                'total_parameters_requested': len(citus_parameters),
+                'successful_parameters': successful_params,
+                'failed_parameters': failed_params,
+                'method': 'SHOW_commands',
+                'success_rate': f"{(successful_params/len(citus_parameters)*100):.1f}%"
+            }
+            
+            log.info(f"Collected {successful_params}/{len(citus_parameters)} Citus GUC parameters using SHOW commands")
+            return guc_params
+            
+        except Exception as e:
+            log.error(f"Error collecting Citus GUC parameters: {e}")
+            return {'error': str(e)}
+    
+    def _collect_diskann_parameters(self, cursor) -> dict:
+        """Collect DiskANN GUC parameters using SHOW commands."""
+        try:
+            diskann_params = {}
+            
+            # First, set session parameters exactly like in init() method
+            try:
+                session_options: dict[str, Any] = self.case_config.session_param()
+                
+                if len(session_options) > 0:
+                    for setting_name, setting_val in session_options.items():
+                        if 'diskann' in setting_name.lower():  # Only set DiskANN params
+                            command = sql.SQL("SET {setting_name} = {setting_val};").format(
+                                setting_name=sql.Identifier(setting_name),
+                                setting_val=sql.Literal(str(setting_val)),
+                            )
+                            cursor.execute(command)
+                            log.info(f"Set DiskANN parameter: {setting_name} = {setting_val}")
+                
+                # Also set iterative_search to a default value since it's not in session_param()
+                try:
+                    cursor.execute("SET diskann.iterative_search = 'Relaxed_Order'")
+                    log.info("Set DiskANN parameter: diskann.iterative_search = Relaxed_Order (default)")
+                except Exception as e:
+                    log.warning(f"Failed to set diskann.iterative_search: {e}")
+                
+                cursor.connection.commit()
+                log.info("Successfully applied DiskANN session parameters")
+                
+            except Exception as e:
+                log.warning(f"Failed to set DiskANN session parameters: {e}")
+            
+            # Define the 2 essential DiskANN parameters to collect
+            diskann_guc_parameters = [
+                'diskann.l_value_is',
+                'diskann.iterative_search'
+            ]
+            
+            # Use simple SHOW commands for each parameter
+            successful_params = 0
+            failed_params = 0
+            
+            for param in diskann_guc_parameters:
+                try:
+                    cursor.execute(f"SHOW {param}")
+                    result = cursor.fetchone()
+                    diskann_params[param] = result[0] if result else 'NOT_AVAILABLE'
+                    successful_params += 1
+                except Exception as e:
+                    diskann_params[param] = f'ERROR: {str(e)}'
+                    failed_params += 1
+            
+            # Add collection metadata
+            diskann_params['_collection_info'] = {
+                'timestamp': datetime.now().isoformat(),
+                'total_parameters_requested': len(diskann_guc_parameters),
+                'successful_parameters': successful_params,
+                'failed_parameters': failed_params,
+                'method': 'SHOW_commands_with_session_setup',
+                'success_rate': f"{(successful_params/len(diskann_guc_parameters)*100):.1f}%"
+            }
+            
+            log.info(f"Collected {successful_params}/{len(diskann_guc_parameters)} DiskANN GUC parameters using SHOW commands")
+            return diskann_params
+            
+        except Exception as e:
+            log.error(f"Error collecting DiskANN GUC parameters: {e}")
+            return {'error': str(e)}
+    
+    def _collect_citus_runtime_state(self, cursor) -> dict:
+        """Collect current Citus runtime state."""
+        try:
+            # Get shard distribution across workers - single query only
+            cursor.execute("""
+                SELECT nodename, nodeport, count(*) as shard_count_on_node
+                FROM pg_dist_shard
+                JOIN pg_dist_placement USING (shardid)
+                JOIN pg_class ON (logicalrelid = oid)
+                JOIN pg_dist_node USING (groupid)
+                WHERE relname = 'pg_diskann_collection'
+                GROUP BY (nodename, nodeport)
+                ORDER BY nodeport
+            """)
+            results = cursor.fetchall()
+            
+            return {
+                'shards_per_worker': [
+                    {
+                        'worker_node': row[0],
+                        'worker_port': row[1], 
+                        'shard_count': row[2]
+                    } for row in results
+                ]
+            }
+            
+        except Exception as e:
+            log.error(f"Error collecting Citus runtime state: {e}")
+            return {'error': str(e)}
+    
+    def _collect_query_plans(self) -> dict:
+        """
+        Collect EXPLAIN ANALYZE plans for the QPS benchmark query.
+        This runs in a completely isolated connection to avoid transaction conflicts.
+        """
+        log.info("🔍 Collecting query execution plan in isolated connection...")
+        try:
+            # Create a completely new, isolated connection for this specific task
+            with psycopg.connect(**self.db_config) as conn:
+                register_vector(conn)
+                with conn.cursor() as cursor:
+                    query_plans = {}
+
+                    # 1. Must be the FIRST command - disable local execution
+                    cursor.execute("SET LOCAL citus.enable_local_execution TO OFF;")
+                    log.info("Set citus.enable_local_execution to OFF for EXPLAIN.")
+
+                    # 2. Set up the same session parameters as during the benchmark
+                    try:
+                        session_options: dict[str, Any] = self.case_config.session_param()
+                        if len(session_options) > 0:
+                            for setting_name, setting_val in session_options.items():
+                                command = sql.SQL("SET {setting_name} = {setting_val};").format(
+                                    setting_name=sql.Identifier(setting_name),
+                                    setting_val=sql.Literal(str(setting_val)),
+                                )
+                                cursor.execute(command)
+                        
+                        cursor.execute("SET diskann.iterative_search = 'Relaxed_Order'")
+                        log.info("Session parameters set for EXPLAIN.")
+                    except Exception as e:
+                        log.warning(f"Could not set session parameters for EXPLAIN: {e}")
+
+                    # 3. Reconstruct the exact QPS benchmark query
+                    unfiltered_search_query = sql.Composed([
+                        sql.SQL("SELECT id FROM public.{} ORDER BY embedding ").format(
+                            sql.Identifier(self.table_name),
+                        ),
+                        sql.SQL(self.case_config.search_param()["metric_fun_op"]),
+                        sql.SQL(" %s::vector LIMIT %s::int"),
+                    ])
+
+                    # 4. Get a sample vector from the table
+                    try:
+                        cursor.execute(f"SELECT embedding FROM public.{self.table_name} LIMIT 1")
+                        sample_vector = cursor.fetchone()[0]
+                    except Exception as e:
+                        log.error(f"Could not fetch sample vector: {e}")
+                        return {'error': 'Could not fetch sample vector for EXPLAIN.', 'details': str(e)}
+
+                    # 5. Run EXPLAIN with FORMAT JSON
+                    try:
+                        explain_query = sql.SQL("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ") + unfiltered_search_query
+                        cursor.execute(explain_query, (sample_vector, 100))
+                        plan_result = cursor.fetchone()[0]
+                        
+                        query_plans['qps_benchmark_plan'] = {
+                            'query_sql': unfiltered_search_query.as_string(conn),
+                            'plan': plan_result,
+                        }
+                        log.info("✅ Successfully collected QPS benchmark query plan.")
+                    except Exception as e:
+                        log.error(f"Failed to run EXPLAIN: {e}")
+                        query_plans['qps_benchmark_plan'] = {
+                            'error': 'Failed to execute EXPLAIN.', 
+                            'details': str(e)
+                        }
+                    
+                    return query_plans
+
+        except Exception as e:
+            log.error(f"Critical error in _collect_query_plans: {e}")
+            return {'error': str(e)}
