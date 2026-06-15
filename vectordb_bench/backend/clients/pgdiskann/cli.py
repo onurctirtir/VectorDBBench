@@ -118,6 +118,7 @@ class PgDiskAnnTypedDict(CommonTypedDict):
             required=False,
         ),
     ]
+    # TODO: should be able to specify the next arg (shard_count) only if enable_citus_distribution
     enable_citus_distribution: Annotated[
         bool,
         click.option(

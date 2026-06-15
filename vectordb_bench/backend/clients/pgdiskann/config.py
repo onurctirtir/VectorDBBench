@@ -129,6 +129,7 @@ class PgDiskANNImplConfig(PgDiskANNIndexConfig):
     quantized_fetch_limit: int | None = None
     maintenance_work_mem: str | None = None
     max_parallel_workers: int | None = None
+    # TODO: shard_count should be a part of enable_citus_distribution
     enable_citus_distribution: bool = True  # Enable Citus distribution by default
     shard_count: int = 8  # Optimal for 500K rows (8 shards * ~62.5K rows per shard)
 

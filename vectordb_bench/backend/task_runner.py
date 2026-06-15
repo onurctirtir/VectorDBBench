@@ -334,9 +334,9 @@ class CaseRunner(BaseModel):
             # Collect database configuration metrics after benchmark completion
             # while data is still loaded in the database
             try:
-                if hasattr(self.db, 'collect_post_benchmark_config'):
+                if hasattr(self.db, 'collect_post_benchmark_data'):
                     log.info("🔍 Collecting post-benchmark configuration metrics...")
-                    post_config = self.db.collect_post_benchmark_config()
+                    post_config = self.db.collect_post_benchmark_data()
                     if post_config:
                         m.post_benchmark_metrics = post_config
                         log.info(f"✅ Collected {len(post_config)} post-benchmark metric categories")

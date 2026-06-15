@@ -11,58 +11,6 @@ from datetime import datetime
 from pathlib import Path
 
 
-def print_readable(data, indent=0, file=None, max_list_items=None):
-    """Print JSON data in a clean, readable format."""
-    def write(text):
-        if file:
-            file.write(text + '\n')
-        else:
-            print(text)
-    
-    prefix = "  " * indent
-    
-    if isinstance(data, dict):
-        if not data:
-            write(f"{prefix}(empty)")
-            return
-            
-        for key in sorted(data.keys()):
-            value = data[key]
-            
-            # Special formatting for different value types
-            if isinstance(value, (dict, list)):
-                if isinstance(value, list) and len(value) == 0:
-                    write(f"{prefix}{key}: (empty list)")
-                elif isinstance(value, dict) and len(value) == 0:
-                    write(f"{prefix}{key}: (empty dict)")
-                else:
-                    write(f"{prefix}{key}:")
-                    print_readable(value, indent + 1, file, max_list_items)
-            else:
-                # Simple values on same line
-                if isinstance(value, str) and len(value) > 80:
-                    write(f"{prefix}{key}: {value[:80]}...")
-                else:
-                    write(f"{prefix}{key}: {value}")
-    
-    elif isinstance(data, list):
-        if len(data) == 0:
-            write(f"{prefix}(empty)")
-            return
-            
-        # Show all items (no trimming)
-        for i in range(len(data)):
-            item = data[i]
-            if isinstance(item, (dict, list)):
-                write(f"{prefix}[{i}]:")
-                print_readable(item, indent + 1, file, max_list_items)
-            else:
-                write(f"{prefix}[{i}]: {item}")
-    
-    else:
-        write(f"{prefix}{data}")
-
-
 def convert_json_to_readable(input_file, output_dir="analyses"):
     """Convert JSON file to readable text format."""
     # Load JSON
@@ -119,7 +67,7 @@ def convert_json_to_readable(input_file, output_dir="analyses"):
         # Full data dump with better structure
         f.write("COMPLETE DATA:\n")
         f.write("=" * 60 + "\n")
-        print_readable(data, file=f)
+        f.write(json.dumps(data, indent=2, sort_keys=True))
     
     return output_file
 
