@@ -329,6 +329,26 @@ class CaseRunner(BaseModel):
             raise e from None
         else:
             log.info(f"Performance case got result: {m}")
+            
+            # 🆕 POST-BENCHMARK CONFIGURATION COLLECTION
+            # Collect database configuration metrics after benchmark completion
+            # while data is still loaded in the database
+            try:
+                if hasattr(self.db, 'collect_post_benchmark_config'):
+                    log.info("🔍 Collecting post-benchmark configuration metrics...")
+                    post_config = self.db.collect_post_benchmark_config()
+                    if post_config:
+                        m.post_benchmark_metrics = post_config
+                        log.info(f"✅ Collected {len(post_config)} post-benchmark metric categories")
+                    else:
+                        log.warning("⚠️ Post-benchmark config collection returned empty result")
+                else:
+                    log.debug("📋 Database client does not support post-benchmark config collection")
+            except Exception as e:
+                log.warning(f"❌ Failed to collect post-benchmark config: {e}")
+                # Don't fail the entire benchmark if post-config collection fails
+                m.post_benchmark_metrics = {'error': str(e)}
+            
             return m
 
     def _run_streaming_case(self) -> Metric:
